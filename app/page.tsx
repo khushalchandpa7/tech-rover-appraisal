@@ -5,9 +5,9 @@
 
 import { Suspense } from 'react';
 import { odooService } from '@/lib/odoo';
-import EmployeeCard from '@/components/employee-card';
-import DashboardSkeleton from '@/components/dashboard-skeleton';
-import Sidebar from '@/components/sidebar';
+import DashboardSkeleton from '../components/dashboard-skeleton';
+import Sidebar from '../components/sidebar';
+import EmployeeCard from '../components/employee-card';
 
 export default async function DashboardPage() {
   // Fetch dashboard data
