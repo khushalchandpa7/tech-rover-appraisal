@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import { Geist_Mono, Plus_Jakarta_Sans } from "next/font/google";
 import { SessionProvider } from "next-auth/react";
 
-import { auth } from "@/auth";
+import { auth } from "@/lib/auth";
 import { AppProviders } from "@/providers/AppProviders";
 
 import "./globals.css";

@@ -1,4 +1,4 @@
-import { signIn } from "@/auth";
+import { signIn } from "@/lib/auth";
 
 export const metadata = {
   title: "Sign In — TechRover Appraisals",
