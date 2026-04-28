@@ -1,331 +1,276 @@
-/**
- * Odoo Service Layer for TechRover Automated Appraisal Process
- * This module provides a robust service pattern for connecting to Odoo and fetching data
- * while maintaining security through server-side operations.
- */
+import "server-only";
 
-import xmlrpc from 'xmlrpc';
-import { env } from 'process';
+import xmlrpc from "xmlrpc";
+import { cacheTag, cacheLife } from "next/cache";
 
-// Define TypeScript interfaces for Odoo data models
-export interface OdooEmployee {
-  id: number;
-  name: string;
-  email?: string;
-  work_email?: string;
-  work_phone?: string;
-  department_id?: [number, string];
-  job_id?: [number, string];
-  manager_id?: [number, string];
-  active?: boolean;
+import { env } from "./env";
+import type { OdooEmployeeRaw, OdooAppraisalRaw } from "@/types/odoo";
+import type { Employee, Appraisal } from "@/types/employee";
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Public types
+ * ────────────────────────────────────────────────────────────────────── */
+
+export type OdooDomain = ReadonlyArray<unknown>;
+
+export interface OdooSearchReadOptions {
+  domain?: OdooDomain;
+  fields?: readonly string[];
+  offset?: number;
+  limit?: number;
+  order?: string;
 }
 
-export interface OdooAppraisal {
-  id: number;
-  name: string;
-  employee_id: [number, string];
-  date_start: string;
-  date_end: string;
-  state: 'draft' | 'confirm' | 'done';
-  overall_appraisal?: string;
-  goals_evaluation?: string;
-  evaluation_note?: string;
-  manager_id?: [number, string];
-  review_date?: string;
-}
+/* ─────────────────────────────────────────────────────────────────────────
+ * XML-RPC clients (lazy, one per process)
+ * ────────────────────────────────────────────────────────────────────── */
 
-export interface OdooProject {
-  id: number;
-  name: string;
-  date_start?: string;
-  date?: string;
-  user_id?: [number, string];
-  partner_id?: [number, string];
-  stage_id?: [number, string];
-  progress?: number;
-  task_count?: number;
-  completed_task_count?: number;
-}
+type XmlRpcClient = ReturnType<typeof xmlrpc.createClient>;
 
-export interface OdooTimesheet {
-  id: number;
-  name: string;
-  date: string;
-  unit_amount: number;
-  project_id?: [number, string];
-  task_id?: [number, string];
-  employee_id?: [number, string];
-  account_id?: [number, string];
-}
+const isSecure = env.ODOO_URL.startsWith("https://");
+const createClient = isSecure ? xmlrpc.createSecureClient : xmlrpc.createClient;
 
-// Configuration interface
-interface OdooConfig {
-  url: string;
-  db: string;
-  username: string;
-  password: string;
-}
+const commonClient: XmlRpcClient = createClient({
+  url: `${env.ODOO_URL}/xmlrpc/2/common`,
+});
+const objectClient: XmlRpcClient = createClient({
+  url: `${env.ODOO_URL}/xmlrpc/2/object`,
+});
 
-// Service class for Odoo operations
-export class OdooService {
-  private client: xmlrpc.Client;
-  private config: OdooConfig;
-  private uid: number | null = null;
-
-  constructor() {
-    this.config = {
-      url: env.ODOO_URL || 'http://localhost:8069',
-      db: env.ODOO_DB_NAME || 'techrover_db',
-      username: env.ODOO_USERNAME || 'admin',
-      password: env.ODOO_PASSWORD || 'admin'
-    };
-
-    this.client = xmlrpc.createClient({
-      host: new URL(this.config.url).hostname,
-      port: new URL(this.config.url).port || 8069,
-      path: '/xmlrpc/2/common',
-      https: new URL(this.config.url).protocol === 'https:'
+function methodCall<T>(
+  client: XmlRpcClient,
+  method: string,
+  params: unknown[],
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    client.methodCall(method, params, (err: unknown, value: unknown) => {
+      if (err) reject(err);
+      else resolve(value as T);
     });
-  }
-
-  /**
-   * Authenticate with Odoo and get user ID
-   */
-  async authenticate(): Promise<number> {
-    if (this.uid !== null) {
-      return this.uid;
-    }
-
-    try {
-      const uid = await new Promise<number>((resolve, reject) => {
-        this.client.methodCall('authenticate', [
-          this.config.db,
-          this.config.username,
-          this.config.password,
-          {}
-        ], (err: any, result: any) => {
-          if (err) {
-            reject(new Error(`Odoo authentication failed: ${err.message}`));
-          } else {
-            resolve(result);
-          }
-        });
-      });
-
-      this.uid = uid;
-      return uid;
-    } catch (error) {
-      throw new Error(`Failed to authenticate with Odoo: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
-  }
-
-  /**
-   * Generic method to search and read Odoo records
-   * @param model The Odoo model name (e.g., 'hr.employee', 'project.project')
-   * @param domain Search domain filters
-   * @param fields List of fields to fetch
-   * @param limit Maximum number of records to return
-   * @param offset Offset for pagination
-   * @returns Array of records
-   */
-  async searchRead(
-    model: string,
-    domain: any[] = [],
-    fields: string[] = [],
-    limit: number = 100,
-    offset: number = 0
-  ): Promise<any[]> {
-    try {
-      const uid = await this.authenticate();
-      
-      // Create the client for the object method calls
-      const objectClient = xmlrpc.createClient({
-        host: new URL(this.config.url).hostname,
-        port: new URL(this.config.url).port || 8069,
-        path: '/xmlrpc/2/object',
-        https: new URL(this.config.url).protocol === 'https:'
-      });
-
-      // Prepare the search and read parameters
-      const params = [
-        this.config.db,
-        uid,
-        this.config.password,
-        model,
-        'search_read',
-        domain,
-        {
-          fields: fields,
-          limit: limit,
-          offset: offset
-        }
-      ];
-
-      return await new Promise<any[]>((resolve, reject) => {
-        objectClient.methodCall('execute_kw', params, (err: any, result: any) => {
-          if (err) {
-            reject(new Error(`Odoo searchRead failed for model ${model}: ${err.message}`));
-          } else {
-            resolve(result);
-          }
-        });
-      });
-
-    } catch (error) {
-      throw new Error(`Failed to fetch data from Odoo model ${model}: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
-  }
-
-  /**
-   * Get employee data with appraisal information
-   * @param employeeId Specific employee ID or null for all employees
-   * @returns Employee data with appraisal metrics
-   */
-  async getEmployees(employeeId: number | null = null): Promise<OdooEmployee[]> {
-    const domain: any[] = employeeId ? [['id', '=', employeeId]] : [];
-    
-    const fields = [
-      'name',
-      'email',
-      'work_email',
-      'work_phone',
-      'department_id',
-      'job_id',
-      'manager_id',
-      'active'
-    ];
-
-    try {
-      const employees = await this.searchRead('hr.employee', domain, fields);
-      
-      // Map to our interface and add appraisal counts
-      return employees.map((emp: any) => ({
-        id: emp.id,
-        name: emp.name || '',
-        email: emp.email,
-        work_email: emp.work_email,
-        work_phone: emp.work_phone,
-        department_id: emp.department_id,
-        job_id: emp.job_id,
-        manager_id: emp.manager_id,
-        active: emp.active
-      }));
-    } catch (error) {
-      throw new Error(`Failed to fetch employees from Odoo: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
-  }
-
-  /**
-   * Get appraisal data for an employee
-   * @param employeeId The employee ID
-   * @returns Appraisal records
-   */
-  async getEmployeeAppraisals(employeeId: number): Promise<OdooAppraisal[]> {
-    const domain = [['employee_id', '=', employeeId]];
-    
-    const fields = [
-      'name',
-      'date_start',
-      'date_end',
-      'state',
-      'overall_appraisal',
-      'goals_evaluation',
-      'evaluation_note',
-      'review_date'
-    ];
-
-    try {
-      return await this.searchRead('hr.appraisal', domain, fields);
-    } catch (error) {
-      throw new Error(`Failed to fetch appraisals for employee ${employeeId}: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
-  }
-
-  /**
-   * Get project data for an employee
-   * @param employeeId The employee ID
-   * @returns Project records
-   */
-  async getEmployeeProjects(employeeId: number): Promise<OdooProject[]> {
-    const domain = [['user_id', '=', employeeId]];
-    
-    const fields = [
-      'name',
-      'date_start',
-      'date',
-      'stage_id',
-      'progress',
-      'task_count',
-      'completed_task_count'
-    ];
-
-    try {
-      return await this.searchRead('project.project', domain, fields);
-    } catch (error) {
-      throw new Error(`Failed to fetch projects for employee ${employeeId}: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
-  }
-
-  /**
-   * Get timesheet data for an employee
-   * @param employeeId The employee ID
-   * @returns Timesheet records
-   */
-  async getEmployeeTimesheets(employeeId: number): Promise<OdooTimesheet[]> {
-    const domain = [['employee_id', '=', employeeId]];
-    
-    const fields = [
-      'name',
-      'date',
-      'unit_amount',
-      'project_id',
-      'task_id'
-    ];
-
-    try {
-      return await this.searchRead('account.analytic.line', domain, fields);
-    } catch (error) {
-      throw new Error(`Failed to fetch timesheets for employee ${employeeId}: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
-  }
-
-  /**
-   * Get dashboard summary data
-   * @returns Summary statistics for the dashboard
-   */
-  async getDashboardSummary(): Promise<{
-    totalEmployees: number;
-    totalAppraisals: number;
-    pendingAppraisals: number;
-    lastSync: string;
-  }> {
-    try {
-      // Get employee count
-      const employees = await this.searchRead('hr.employee', [], ['id'], 1, 0);
-      const totalEmployees = employees.length;
-
-      // Get appraisal count
-      const appraisals = await this.searchRead('hr.appraisal', [], ['id'], 1, 0);
-      const totalAppraisals = appraisals.length;
-
-      // Get pending appraisals (state = 'draft' or 'confirm')
-      const pendingDomain = [
-        ['state', 'in', ['draft', 'confirm']]
-      ];
-      const pendingAppraisals = await this.searchRead('hr.appraisal', pendingDomain, ['id'], 1, 0);
-      const pendingCount = pendingAppraisals.length;
-
-      return {
-        totalEmployees,
-        totalAppraisals,
-        pendingAppraisals: pendingCount,
-        lastSync: new Date().toISOString()
-      };
-    } catch (error) {
-      throw new Error(`Failed to fetch dashboard summary from Odoo: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
-  }
+  });
 }
 
-// Export a singleton instance for easy use
-export const odooService = new OdooService();
+/* ─────────────────────────────────────────────────────────────────────────
+ * Authentication — UID is memoized for the lifetime of the server runtime.
+ * ────────────────────────────────────────────────────────────────────── */
+
+let cachedUid: number | null = null;
+
+export async function authenticate(): Promise<number> {
+  if (cachedUid !== null) return cachedUid;
+
+  const uid = await methodCall<number | false>(commonClient, "authenticate", [
+    env.ODOO_DB,
+    env.ODOO_USERNAME,
+    env.ODOO_API_KEY,
+    {},
+  ]);
+
+  if (!uid) {
+    throw new Error(
+      "Odoo authentication failed — verify ODOO_DB, ODOO_USERNAME, and ODOO_API_KEY.",
+    );
+  }
+
+  cachedUid = uid;
+  return uid;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Generic execute_kw wrapper
+ * ────────────────────────────────────────────────────────────────────── */
+
+export async function executeKw<T>(
+  model: string,
+  method: string,
+  args: readonly unknown[] = [],
+  kwargs: Readonly<Record<string, unknown>> = {},
+): Promise<T> {
+  const uid = await authenticate();
+  return methodCall<T>(objectClient, "execute_kw", [
+    env.ODOO_DB,
+    uid,
+    env.ODOO_API_KEY,
+    model,
+    method,
+    args,
+    kwargs,
+  ]);
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Reusable typed helpers
+ * ────────────────────────────────────────────────────────────────────── */
+
+export function searchRead<T = Record<string, unknown>>(
+  model: string,
+  {
+    domain = [],
+    fields = [],
+    offset = 0,
+    limit = 80,
+    order = "",
+  }: OdooSearchReadOptions = {},
+): Promise<T[]> {
+  return executeKw<T[]>(model, "search_read", [domain], {
+    fields,
+    offset,
+    limit,
+    order,
+  });
+}
+
+export function count(model: string, domain: OdooDomain = []): Promise<number> {
+  return executeKw<number>(model, "search_count", [domain]);
+}
+
+export async function readById<T = Record<string, unknown>>(
+  model: string,
+  id: number,
+  fields: readonly string[] = [],
+): Promise<T | null> {
+  const rows = await executeKw<T[]>(model, "read", [[id]], { fields });
+  return rows[0] ?? null;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Domain mappers
+ * ────────────────────────────────────────────────────────────────────── */
+
+const stringOrNull = (v: string | false): string | null =>
+  typeof v === "string" && v.length > 0 ? v : null;
+
+export function mapEmployee(raw: OdooEmployeeRaw): Employee {
+  return {
+    id: raw.id,
+    name: raw.name,
+    email: stringOrNull(raw.work_email),
+    jobTitle: stringOrNull(raw.job_title),
+    department: raw.department_id ? raw.department_id[1] : null,
+    managerName: raw.parent_id ? raw.parent_id[1] : null,
+    avatarBase64: stringOrNull(raw.image_128),
+  };
+}
+
+export function mapAppraisal(raw: OdooAppraisalRaw): Appraisal {
+  return {
+    id: raw.id,
+    displayName: raw.display_name,
+    employeeId: raw.employee_id ? raw.employee_id[0] : 0,
+    employeeName: raw.employee_id ? raw.employee_id[1] : null,
+    stage: raw.stage_id ? raw.stage_id[1] : null,
+    deadline: stringOrNull(raw.appraisal_deadline),
+    periodFrom: stringOrNull(raw.app_period_from),
+    isDraft: raw.check_draft,
+    isSent: raw.check_sent,
+    isDone: raw.check_done,
+    isCancelled: raw.check_cancel,
+  };
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Field lists
+ * ────────────────────────────────────────────────────────────────────── */
+
+const EMPLOYEE_FIELDS = [
+  "id",
+  "name",
+  "work_email",
+  "job_title",
+  "department_id",
+  "parent_id",
+  "active",
+  "image_128",
+] as const;
+
+const ACTIVE_DOMAIN: OdooDomain = [["active", "=", true]];
+
+const APPRAISAL_FIELDS = [
+  "id",
+  "display_name",
+  "employee_id",
+  "stage_id",
+  "appraisal_deadline",
+  "app_period_from",
+  "check_draft",
+  "check_sent",
+  "check_done",
+  "check_cancel",
+] as const;
+
+/* ─────────────────────────────────────────────────────────────────────────
+ * Cached resource helpers — use 'use cache' directive (Next.js 16).
+ *
+ * Requires `experimental.useCache: true` in next.config.ts.
+ * cacheTag() enables on-demand revalidation via revalidateTag(tag, 'max').
+ * cacheLife('minutes') ≈ 5-min stale-while-revalidate window.
+ * ────────────────────────────────────────────────────────────────────── */
+
+export async function getCachedEmployees(
+  limit: number,
+  offset: number,
+): Promise<OdooEmployeeRaw[]> {
+  "use cache";
+  cacheLife("minutes");
+  cacheTag("employees");
+
+  return searchRead<OdooEmployeeRaw>("hr.employee", {
+    domain: ACTIVE_DOMAIN,
+    fields: EMPLOYEE_FIELDS,
+    limit,
+    offset,
+    order: "name asc",
+  });
+}
+
+export async function getCachedActiveEmployeeCount(): Promise<number> {
+  "use cache";
+  cacheLife("minutes");
+  cacheTag("employees");
+
+  return count("hr.employee", ACTIVE_DOMAIN);
+}
+
+export async function getCachedDepartmentCount(): Promise<number> {
+  "use cache";
+  cacheLife("minutes");
+  cacheTag("departments");
+
+  return count("hr.department", []);
+}
+
+export async function getCachedPendingAppraisalCount(): Promise<number> {
+  "use cache";
+  cacheLife("minutes");
+  cacheTag("appraisals");
+
+  return count("hr.appraisal", [["check_done", "=", false], ["check_cancel", "=", false]]);
+}
+
+export async function getCachedAppraisals(
+  limit: number,
+  offset: number,
+  domain: OdooDomain = [],
+): Promise<OdooAppraisalRaw[]> {
+  "use cache";
+  cacheLife("minutes");
+  cacheTag("appraisals");
+
+  return searchRead<OdooAppraisalRaw>("hr.appraisal", {
+    domain,
+    fields: APPRAISAL_FIELDS,
+    limit,
+    offset,
+    order: "appraisal_deadline asc",
+  });
+}
+
+export async function getCachedAppraisalCount(
+  domain: OdooDomain = [],
+): Promise<number> {
+  "use cache";
+  cacheLife("minutes");
+  cacheTag("appraisals");
+
+  return count("hr.appraisal", domain);
+}
